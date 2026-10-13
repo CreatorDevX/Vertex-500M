@@ -1,0 +1,46 @@
+# Smoke test for the full pipeline: tiny model, synthetic corpus, CPU.
+# Runs preflight (no test suites) -> data -> stage A (6 steps) -> stage B
+# (2 steps) -> eval -> report, all in a few minutes on CPU with no network.
+# Everything lands in runs/vertex-smoke/.
+run_name: vertex-smoke
+output_dir: runs
+
+data:
+  name: smoke
+  synthetic_tokens: 20000     # toy Markov corpus; skips download + tokenize
+  pack: fixed
+
+model:
+  hc_variant: mhc
+  tiny: true                  # 10.75M CPU-runnable model
+
+train:
+  amp: off
+  device: cpu
+  seed: 0
+  batch_size: 1
+  seq_len: 32
+  no_ckpt: true               # skip activation checkpointing (fast CI)
+  log_every: 1
+  warmup: 2
+  save_every: 2
+  keep_last: 2
+  eval_every: 0               # no val split exists for synthetic data
+  eval_batches: 2
+  allow_identity_map: true    # synthetic data has no tokenizer map
+  stage_a_steps: 6
+  stage_b_steps: 2
+
+eval:
+  batches: 2
+  seq_len: 32
+  batch_size: 1
+  split: all                  # synthetic shards carry no train/val split
+  with_dspark: true
+
+tracking:
+  mode: disabled              # smoke never touches the network
+
+pipeline:
+  run_tests: false            # suites already run in dev; smoke tests plumbing
+  offline: true

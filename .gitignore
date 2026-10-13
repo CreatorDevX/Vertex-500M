@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Training artefacts (regenerated / large; never commit). Root-scoped: a
+# leading slash pins these to the repo root so they can never match source
+# directories (notably vertex500m/data/ and vertex500m/train/).
+/runs/
+/data/
+/corpus/
+*.pt
+*.bin
+*.idx.npy
+token_map.json
+manifest.json
+metrics.jsonl
+train.log
+wandb/
+.wandb/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

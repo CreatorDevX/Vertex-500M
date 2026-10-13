@@ -9,8 +9,43 @@ MoE→dense conversion: `vertex500m-dense.md`. Hyper-connection study: `mHC-lite
 ## Quick start
 
 ```bash
-pip install torch transformers numpy
+pip install torch transformers numpy datasets pyyaml wandb
+# (or: pip install -e . from the repo root)
+```
 
+### Automated: one command, whole pipeline (recommended)
+
+All configuration lives in a YAML file that is settled BEFORE deployment --
+the training device needs no terminal input, ever:
+
+```bash
+# 0. check the config on a dev machine (validates everything, runs preflight,
+#    touches nothing else). Do this BEFORE deploying.
+python -m vertex500m.pipeline --config configs/t4-fp16.yaml --validate
+
+# 1. run the whole chain: preflight -> data (download + tokenize + split)
+#    -> stage A -> stage B -> eval -> report. Everything lands in
+#    runs/<run_name>/ (checkpoints, metrics.jsonl, report.md, logs).
+python -m vertex500m.pipeline --config configs/t4-fp16.yaml
+
+# 2. resume after anything (crash, Ctrl+C, deadline): re-run the SAME command.
+#    Completed stages are skipped; interrupted training continues at the exact
+#    step, LR position, RNG state and data order. A changed config refuses
+#    unless passed --allow-config-change.
+python -m vertex500m.pipeline --config configs/t4-fp16.yaml
+
+# 3. try it fast, on CPU, with no network:
+python -m vertex500m.pipeline --config configs/smoke.yaml
+```
+
+`configs/t4-fp16.yaml` is the documented real-run starting point (single T4,
+fp16, FineWeb-Edu sample, wandb online); `configs/smoke.yaml` runs the full
+chain on CPU in minutes. Metrics go to `metrics_*.jsonl` AND wandb
+(`tracking.mode: offline` records locally for a later `wandb sync`).
+
+### Manual mode: the individual steps
+
+```bash
 # 0. verify the parameter accounting (reproduces the MoE preset as a gate)
 python -m vertex500m.params
 python -m vertex500m.params --hc-variant mhc-lite    # the exact-Birkhoff variant
@@ -18,8 +53,11 @@ python -m vertex500m.params --hc-variant mhc-lite    # the exact-Birkhoff varian
 # 1. verify the architecture
 python -m vertex500m.tests              # 90+ checks, all must pass
 python -m vertex500m.test_checkpoint    # save/load, both hc variants, stage-B freeze
+python -m vertex500m.test_pipeline      # data pipeline, training QoL, orchestrator
 
 # 2. tokenize your corpus and build the Engram token map
+#    (writes {name}_{train|val}_*.bin + .idx.npy doc index + manifest.json;
+#    --val-fraction 0 for a train-only corpus)
 python -m vertex500m.tokenize --tokenizer JamesQuartz/qt-VI1.3-32k \
     --input corpus/ --out data/ --name web --save-map token_map.json
 
@@ -51,16 +89,33 @@ python -m vertex500m.train --data data/ --token-map token_map.json \
     --hc-variant mhc-lite --steps 3000 --out backbone_lite.pt
 ```
 
-Resume an interrupted run with `--init backbone.pt --resume` (optimizer momentum and the
-GradScaler's loss scale are both saved; without `--resume` the weights load but momentum
-and the scale restart).
+Resume an interrupted run with `--init backbone.pt --resume`. Resume is EXACT:
+the checkpoint carries the step counter, the LR schedule position
+(`total_steps`/`warmup` -- the checkpoint's win over conflicting CLI flags),
+all RNG streams, the dataloader epoch + in-epoch position (per-epoch
+reseeding rebuilds the identical data order), the optimizer state AND the
+GradScaler state. Without `--resume` the weights load but everything else
+restarts. Periodic checkpoints (`--save-every N` -> `{stage}.step_{n}.pt` +
+`{stage}.latest.pt`, `--keep-last` rotation, `{stage}.best.pt` on validation
+improvement), in-loop validation (`--eval-every`), gradient clipping
+(`--grad-clip`), accumulation (`--accum-steps`), early exits
+(`--target-loss`, `--deadline-s`), NaN-loss fail-fast, SIGINT/SIGTERM
+save-then-exit, and a `metrics.jsonl` log round out the training QoL; see
+`train/__main__.py` for the full flag list.
 
-Two GPUs (torchrun; note a T4 has no NVLink, so the allreduce runs over PCIe):
+Two GPUs (torchrun; note a T4 has no NVLink, so the allreduce runs over PCIe).
+Prefer the pipeline (`train.dist_nproc: 2` launches the stages under
+torchrun itself); manually:
 
 ```bash
 torchrun --nproc_per_node 2 -m vertex500m.train --amp fp16 \
     --data data/ --token-map token_map.json --steps 3000 --out backbone.pt
 ```
+
+DDP is rank-sharded (DistributedSampler, per-epoch `set_epoch`, so resume
+restores each rank's slice) with fully-seeded per-rank RNGs -- the old
+identical-shuffle-across-ranks bug is fixed and pinned by tests. In-loop
+validation all-reduces (nll, ntokens) so all ranks agree on the CE.
 
 ## Mixed precision (`--amp fp16|bf16|off`)
 
@@ -182,16 +237,29 @@ model.py        Block/Transformer, tied VertexHead, deferred DSpark, segment-2 c
 init_weights.py the initialization the spec omits
 optim.py        Muon + AdamW + Sinkhorn, per spec 19.2; per-group lr_mult so a
                 schedule scales the partition instead of collapsing it
-train.py        stage A pretraining, stage B DSpark, chunked CE, resumable checkpoints,
-                --amp + GradScaler, torchrun/DDP, --compile
+factory.py      shared model construction + checkpoint loading (train/eval/bench/tests
+                used to each carry their own copy, including an attach/load-order bug)
+train/          stage A/B loops (schedule, losses, checkpoint+TRAIN state, dist,
+                metrics), exact resume, periodic/best checkpoints, in-loop eval,
+                grad clip + accumulation, early exits, signal save-then-exit.
+                `python -m vertex500m.train` still works via train/__main__.py
 dspark_loss.py  stage-B objective (the backbone loss is not differentiable when frozen)
-tokenize.py     qt-VI.1.3 → uint16 shards + Engram compressed token map
-data.py         packed-window dataloader
-eval.py         held-out CE / perplexity, chunked; --with-dspark reports acceptance
+data/           shard I/O (lazy mmap) + document packing + HF-datasets download +
+                seeded train/val splitting + manifest.json. `from vertex500m.data
+                import build_dataloader` still works; `data.py` moved to data/shards.py
+tokenize.py     qt-VI.1.3 → {name}_{train|val}_*.bin + .idx.npy doc index + manifest.json
+eval.py         held-out CE / perplexity, chunked; --with-dspark reports acceptance;
+                --split now REFUSES non-matching splits instead of silently scoring all shards
 generate.py     sampling + speculative accept/reject, with cache rollback
 bench.py        decode throughput, DSpark break-even, and `--train` (AMP sweep)
+pipeline/       the automation layer: run_config (YAML schema + validation),
+                preflight (fail-fast checks), tracker (wandb via metrics tailing),
+                orchestrator (idempotent stages, subprocess isolation, state.json),
+                report (report.md + summary.json). `python -m vertex500m.pipeline`
 tests.py        architecture acceptance suite + mixed-precision group
-test_checkpoint.py  save/load round-trip (both hc variants) + stage-B freeze
+test_checkpoint.py  save/load round-trip (both hc variants) + stage-B freeze +
+                real optimizer-state survival
+test_pipeline.py    data pipeline + training QoL + DDP + orchestrator tests
 ```
 
 ## Bugs found in the source docs
@@ -248,6 +316,52 @@ Recorded so they are not reintroduced; all are covered by a test now.
 9. **DSpark's confidence head never trained** — `survived` was computed and discarded, so
    `confidence_head` gradients were permanently `None`.
 10. **`eval.py --with-dspark` reported nothing.** It attached DSpark, then ran plain CE.
+
+## Bugs found during the automation work
+
+Same deal as above: each is a crash or a silent wrong answer, each now has a
+test that fails without the fix.
+
+1. **Checkpoints never actually saved the optimizer state.** The payload
+    wrapped `o.state_dict()` once more (`{"state": o.state_dict(), ...}`),
+    which `load_state_dict` validates past and then silently ignores -- its
+    keys never match a parameter. Resume logged "restored optimizer state"
+    while every momentum buffer restarted from zero, diverging the run within
+    steps. The payload is now `o.state_dict()` verbatim (which also preserves
+    the custom `lr_mult` groups), with an unwrapper for legacy checkpoints.
+2. **The covering test never tested it.** `test_optimizer_state_roundtrip`
+    round-tripped MODEL weights, built FRESH optimizers on both sides, warmed
+    both for 2 steps (washing out the momentum difference), and compared --
+    so bug 1 passed the suite. `test_optimizer_state_survives_real_checkpoint`
+    now saves through the real path and requires a bit-identical next step.
+3. **Stage-B resume threw the trained drafter away.** `--init full.pt`
+    loaded into a backbone without `mtp.*` (every drafter weight "unexpected")
+    and then `init_new_dspark_params` re-randomised all of it. Stage B now
+    attaches BEFORE loading and initialises only the `mtp.*` names the
+    checkpoint did not supply (a fresh stage B behaves exactly as before).
+4. **DDP trained on duplicated data.** Only the weight init was rank-seeded;
+    every rank shuffled identically, so the allreduce averaged N copies of
+    the same batch. Ranks now get fully-seeded RNGs plus a rank-sharded
+    DistributedSampler (advanced per epoch, resume-aware).
+5. **Dataloader generator state cannot be resumed.** `iter(loader)` draws
+    worker seeds eagerly while the shuffle permutation is drawn lazily on
+    first `next()`, so restoring a saved generator state and calling `iter()`
+    again draws a DIFFERENT permutation (pinned by a failing test). Resume is
+    now epoch-based: each epoch reseeds `seed + epoch`, so both sides perform
+    the identical draw sequence.
+6. **`persistent_workers=True` breaks epoch determinism.** Worker processes
+    carry state across iterators, so a reseeded epoch-1 order did not match a
+    fresh one. Workers now respawn per epoch (seconds per epoch, negligible
+    next to training).
+7. **The pipeline's eval built the wrong model.** `eval_argv` did not forward
+    `model.tiny`, so a smoke run evaluated tiny weights with the full 484M
+    model (size-mismatch crash). Caught by the smoke run itself.
+8. **`threading.Thread` owns `_stop`.** The wandb tailer thread named its stop
+    `Event` `_stop`, which shadows the internal method `join()` calls --
+    `TypeError` on finish. Renamed.
+9. **Preflight ignored `pipeline.run_tests: false`.** The skip logic only
+    looked at the passing record, so smoke runs paid for the full suites.
+    Caught by the smoke run itself.
 
 ## Bugs found during the mixed-precision migration
 
@@ -365,10 +479,12 @@ each is now covered by a test in `tests.py`.
 - **`embed.weight` uses plain AdamW, not the released momentum+Sinkhorn algorithm.**
   The spec's algorithm assumes a table that is *either* an embedding *or* a head; with
   tying it is both, and that case is untested (`vertex500m-dense.md` §20.5).
-- **`--split` falls back to all shards** if the substring matches nothing, so a "val"
-  evaluation can silently run on training data. Check the printed shard count.
+- **`--split` used to fall back to all shards** if the substring matched nothing,
+  so a "val" evaluation could silently run on training data. It now REFUSES
+  (pass `--split all` to select everything explicitly).
 - **`--amp bf16` is a trap on a T4.** sm_75 has no bf16 tensor cores; it computes at
   roughly FP32 speed with doubled activation bytes. Correct, just pointless — use fp16.
+  (The pipeline turns this into a hard preflight error instead of a warning.)
 - **The GradScaler's inf-skip rate for the real model is unmeasured.** What was measured:
   on `PRESET.tiny()` with CPU fp16, 0 skips in 36 steps at `init_scale` 65536 / 8192 /
   2048, but 2 skips in 25 steps in one differently-drawn run with checkpointing on. So
@@ -377,13 +493,27 @@ each is now covered by a test in `tests.py`.
   65504 — three to four orders of magnitude of headroom, not an order. None of that
   transfers to the 503.8M model. `bench.py --train` prints the rate; if it is above ~5%,
   `--amp fp16` is the wrong tool here and that should be recorded.
-- **Multi-GPU is wired but unvalidated here.** `wrap_ddp` uses `static_graph=True`
+- **Multi-GPU is fixed but 2-proc validation still needs a GPU box.**
+  `wrap_ddp` uses `static_graph=True`
   specifically because the tied `embed.weight` receives two autograd contributions per
   forward and the default reducer can fire between them, dropping the head's gradient
   with no error. `tests.py::test_ddp_tied_embedding_reduces_once` pins this against a
   single-process reference, but it SKIPs wherever a process group cannot be created —
   which includes the CPU-only build this was developed on (gloo cannot resolve a device).
-  Run it on the GPU box before trusting a 2xT4 run.
+  The identical-shuffle bug is fixed (rank seeding + DistributedSampler, unit-pinned)
+  and the pipeline can launch stages under torchrun itself (`train.dist_nproc`),
+  but run the 2-proc path on the GPU box before trusting a 2xT4 run.
 - **T4s have no NVLink.** Two of them allreduce ~9 GB of fp32 gradients and parameters
   per step over PCIe. Measure `bench.py --train` single- vs dual-GPU before committing;
   if the allreplace dominates, 1xT4 with a larger batch is the better use of the budget.
+- **The rollback acceptance test is marginal on CPU.** `tests.py`'s "rollback +
+  re-run matches a clean incremental decode" band (2e-2 relative) was tuned on a
+  different BLAS; this CPU box measures 2.098e-02 -- accumulation-order noise on
+  random tokens, while the BIT-exact restore check directly above it passes. Since
+  the pipeline's preflight gates on green suites, run the suites on the target box,
+  or set `pipeline.run_tests: false` after dev verification.
+- **Config is settled before deployment, by design.** The pipeline takes exactly
+  one input (`--config`), never prompts (preflight audits for `input()`), and a
+  resumed run with a changed config refuses unless passed `--allow-config-change`.
+  `tracking.mode: online` needs `WANDB_API_KEY` (or `wandb login`) before deploy;
+  `offline` records locally for a later `wandb sync`.

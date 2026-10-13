@@ -44,8 +44,7 @@ import torch
 
 from .amp import amp_context, make_scaler, set_amp_mode, warn_if_unsupported
 from .config import PRESET
-from .engram import EngramLayout, NgramHashState, identity_token_map
-from .init_weights import init_from_scratch
+from .factory import build_model
 from .optim import build_optimizer
 from .params import count
 from .quant import set_quant_mode
@@ -68,11 +67,7 @@ def timeit(fn, device, warmup=2, iters=8):
 
 
 def build(cfg, hc_variant="mhc"):
-    layout = EngramLayout(cfg)
-    hashes = NgramHashState(cfg, layout, identity_token_map(cfg.vocab_size),
-                            cfg.engram_compressed_vocab_size)
-    return init_from_scratch(cfg, engram_layout=layout, engram_hashes=hashes,
-                             hc_variant=hc_variant)
+    return build_model(cfg, hc_variant=hc_variant)
 
 
 @torch.no_grad()

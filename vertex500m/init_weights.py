@@ -89,7 +89,8 @@ def init_weights(model: Transformer, initializer_range: float = 0.02,
     return model
 
 
-def init_new_dspark_params(model: Transformer, seed: int = 0) -> int:
+def init_new_dspark_params(model: Transformer, seed: int = 0,
+                            names: set[str] | None = None) -> int:
     """Initialize ONLY the parameters `attach_dspark()` created, and return their count.
 
     Why this exists. Stage B builds the drafter AFTER `init_from_scratch()` has already
@@ -107,15 +108,30 @@ def init_new_dspark_params(model: Transformer, seed: int = 0) -> int:
     scales the draft blocks' projections exactly once.
 
     Calling this on a model with no `mtp` is a no-op.
+
+    `names` restricts the init to a subset of mtp.* parameter names (a stage-B
+    resume passes the names the checkpoint did NOT supply, so the trained
+    drafter it did supply is left alone). `None` means all of mtp.*, exactly as
+    before. An empty set is a no-op that returns 0.
+
+    The block-level inits (hyper-connection params, output-projection
+    downscale) run only for a FRESH drafter -- every mtp.* parameter being
+    inited. The downscale is multiplicative, so re-applying it to a resumed
+    drafter would silently shrink its projections a second time.
     """
-    new = [p for n, p in model.named_parameters() if n.startswith("mtp.")]
+    all_mtp = [n for n, _ in model.named_parameters() if n.startswith("mtp.")]
+    if names is not None and not set(names):
+        return 0
+    fresh = names is None or set(names) >= set(all_mtp)
+    new = [p for n, p in model.named_parameters()
+           if n.startswith("mtp.") and (names is None or n in names)]
     if not new:
         return 0
     g = torch.Generator().manual_seed(seed)
     std = model.cfg.initializer_range
-    fresh = {id(p) for p in new}
+    fresh_ids = {id(p) for p in new}
     for name, p in model.named_parameters():
-        if id(p) not in fresh:
+        if id(p) not in fresh_ids:
             continue
         if "hc_" in name:
             continue
@@ -125,6 +141,10 @@ def init_new_dspark_params(model: Transformer, seed: int = 0) -> int:
             elif p.dim() >= 2:
                 p.normal_(0.0, std, generator=g)
 
+    if not fresh:
+        # Partial init (a resume that recovered some drafter tensors): per-tensor
+        # values above, but no block-level re-init -- see the docstring.
+        return len(new)
     variant = getattr(model, "hc_variant", "mhc")
     for blk in model.mtp:
         init_hc_params(blk.hc_attn_fn, blk.hc_attn_base, blk.hc_attn_scale,

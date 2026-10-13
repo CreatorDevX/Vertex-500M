@@ -19,9 +19,9 @@ Implementation notes that matter for correctness:
     persist across decode steps but must be reset between independent sequences.
   * The Engram hash cache must also be reset, or n-grams leak across documents and the
     number is silently optimistic.
-  * `--split` selects shards by filename substring and FALLS BACK TO ALL SHARDS if
-    nothing matches, so check the shard count in the output before trusting a held-out
-    number.
+   * `--split` selects shards by filename substring and REFUSES to run when nothing
+     matches (pass `--split all` to select every shard explicitly), so a mistyped
+     split can no longer silently evaluate on training data.
   * `--amp` must MATCH how the checkpoint was trained. Evaluating an fp16-trained model
     in fp32 measures the precision gap, not quality; and evaluating in fp16 when the
     caches were allocated for fp32 (or vice versa) is a hard dtype mismatch inside
@@ -42,53 +42,10 @@ import torch
 
 from .amp import amp_context, set_amp_mode, warn_if_unsupported
 from .config import PRESET
-from .engram import EngramLayout, NgramHashState
+from .factory import build_model, load_token_map_json
 from .params import count
 from .quant import set_quant_mode
 from .train import chunked_ce
-
-
-def load_token_map(path):
-    import json
-    d = json.loads(open(path, encoding="utf-8").read())
-    return d["token_map"], d["engram_compressed_vocab_size"], d.get("collisions", 0)
-
-
-def build_model(cfg, ckpt=None, token_map=None, device="cpu", hc_variant="mhc",
-                with_dspark=False):
-    from .init_weights import init_from_scratch
-    layout = EngramLayout(cfg)
-    if token_map is None:
-        from .engram import identity_token_map
-        token_map = identity_token_map(cfg.vocab_size)
-    hashes = NgramHashState(cfg, layout, token_map, cfg.engram_compressed_vocab_size)
-    model = init_from_scratch(cfg, engram_layout=layout, engram_hashes=hashes,
-                              hc_variant=hc_variant)
-    if ckpt:
-        obj = torch.load(ckpt, map_location="cpu", weights_only=False)
-        sd = obj["model"] if isinstance(obj, dict) and "model" in obj else obj
-        saved = (obj.get("config", {}) or {}).get("hc_variant") \
-            if isinstance(obj, dict) and "model" in obj else None
-        if saved and saved != hc_variant:
-            raise SystemExit(
-                f"checkpoint {ckpt} was trained with hc_variant={saved!r} but "
-                f"--hc-variant is {hc_variant!r}. mHC-lite is a reparameterization, not "
-                f"a conversion (mHC-lite.md 1): the projection widths differ (24 vs 32 "
-                f"at hc=4) and there is no bridge. Retrain or pass --hc-variant {saved}.")
-        # Attach BEFORE loading, not after. A stage-B checkpoint carries mtp.* weights;
-        # attaching afterwards makes every one of them "unexpected", so the drafter you
-        # trained is silently thrown away and acceptance is measured on random weights.
-        if with_dspark:
-            model.init_caches(1, cfg.max_seq_len)
-            model.attach_dspark()
-        missing, unexpected = model.load_state_dict(sd, strict=False)
-        if unexpected:
-            print(f"  [warn] unexpected keys: {list(unexpected)[:5]}")
-        print(f"  loaded {ckpt} (missing={len(missing)} unexpected={len(unexpected)})")
-    elif with_dspark:
-        model.init_caches(1, cfg.max_seq_len)
-        model.attach_dspark()
-    return model.to(device).eval()
 
 
 @torch.no_grad()
@@ -152,8 +109,9 @@ def main():
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--data", required=True, help="dir of uint16 .bin shards")
     ap.add_argument("--split", default="val",
-                    help="substring selecting shards; falls back to ALL shards if no "
-                         "shard name matches, so verify the printed count")
+                    help="substring selecting shards. A split that matches nothing "
+                         "is an error (it used to silently evaluate on ALL shards); "
+                         "pass 'all' to select every shard explicitly")
     ap.add_argument("--token-map", default=None, help="JSON from tokenize.py --save-map")
     ap.add_argument("--seq-len", type=int, default=None)
     ap.add_argument("--batch-size", type=int, default=1)
@@ -184,7 +142,7 @@ def main():
 
     token_map, cvs, collisions = (None, 0, 0)
     if args.token_map:
-        token_map, cvs, collisions = load_token_map(args.token_map)
+        token_map, cvs, collisions = load_token_map_json(args.token_map)
         print(f"[token map] compressed_vocab_size={cvs} collisions={collisions}")
         cfg = cfg.with_(engram_compressed_vocab_size=cvs)
 
@@ -202,17 +160,27 @@ def main():
     warn_if_unsupported(mode, torch.device(device).type)
 
     model = build_model(cfg, args.ckpt, token_map, device, args.hc_variant,
-                        with_dspark=args.with_dspark)
+                        with_dspark=args.with_dspark).eval()
     if args.with_dspark:
         with amp_context(mode, torch.device(device).type):
             model.init_caches(args.batch_size, cfg.max_seq_len, device=device)
         model = model.eval()
 
     from .data import list_shards
-    from pathlib import Path
     shards = list_shards(args.data)
-    if args.split:
-        shards = [s for s in shards if args.split in s.name] or shards
+    # --split selects shards by filename substring. A non-matching split used to
+    # silently fall back to ALL shards, so a "val" evaluation could run on training
+    # data; now it refuses. Pass --split all (or an empty string) to select all
+    # shards explicitly.
+    if args.split and args.split != "all":
+        matched = [s for s in shards if args.split in s.name]
+        if not matched:
+            raise SystemExit(
+                f"[eval] --split {args.split!r} matched no shards in {args.data} "
+                f"(found {len(shards)}). Refusing to fall back to all shards: a "
+                f"mistyped split would silently evaluate on training data. Available:\n"
+                + "\n".join(f"  {s.name}" for s in shards))
+        shards = matched
     print(f"[eval] {len(shards)} shard(s), seq_len={args.seq_len or cfg.max_seq_len}")
 
     from .data import PackedTokenDataset

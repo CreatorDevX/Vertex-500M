@@ -16,18 +16,13 @@ import math
 import torch
 
 from .config import PRESET
-from .engram import EngramLayout, NgramHashState, identity_token_map
-from .init_weights import init_from_scratch
+from .factory import build_model
 from .optim import build_optimizer
 from .tests import FAILED, check
 
 
 def _build(cfg, seed=0, hc_variant="mhc"):
-    layout = EngramLayout(cfg)
-    hashes = NgramHashState(cfg, layout, identity_token_map(cfg.vocab_size),
-                            cfg.engram_compressed_vocab_size)
-    return init_from_scratch(cfg, engram_layout=layout, engram_hashes=hashes, seed=seed,
-                             hc_variant=hc_variant)
+    return build_model(cfg, seed=seed, hc_variant=hc_variant)
 
 
 # `perm` is the mHC-lite permutation basis: a CONSTANT [hc!, hc*hc] buffer derived
@@ -265,6 +260,65 @@ def test_optimizer_state_roundtrip():
     check("continued training matches after reload", d < 1e-6, f"max diff {d:.3e}")
 
 
+def _train_step(m, opts, ids):
+    m.init_caches(1, m.cfg.max_seq_len)
+    m.forward_full(ids, use_checkpoint=False)[0].sum().backward()
+    for o in opts:
+        o.step()
+        o.zero_grad(set_to_none=True)
+
+
+def test_optimizer_state_survives_real_checkpoint():
+    """The actual save_checkpoint payload must restore momentum, not just weights.
+
+    REGRESSION: the payload used to wrap `o.state_dict()` once more, which
+    `load_state_dict` silently ignores -- resume logged a restore while every
+    momentum buffer restarted from zero, diverging a resumed run within steps.
+    Train 2 steps, save, restore into a fresh model+optimizers, train 1 more
+    step on both sides: weights must match BIT-exactly (deterministic CPU).
+    """
+    import argparse
+    import tempfile
+    from .train.checkpoint import restore_optimizer_state, save_checkpoint
+    cfg = PRESET.tiny()
+    m = _build(cfg, seed=0)
+    ids = torch.randint(0, cfg.vocab_size, (1, 20))
+    m.init_caches(1, cfg.max_seq_len)
+    opts = build_optimizer(m)
+    m.train()
+    for _ in range(2):
+        _train_step(m, opts, ids)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = f"{tmp}/real.pt"
+        args = argparse.Namespace(out=dest, _dist=None)
+        save_checkpoint(m, args, opts)
+
+        fresh = _build(cfg, seed=999)
+        ck = torch.load(dest, map_location="cpu", weights_only=False)
+        missing, unexpected = fresh.load_state_dict(ck["model"], strict=False)
+        assert not missing and not unexpected, (missing, unexpected)
+        opts_f = build_optimizer(fresh)
+        for o, st in zip(opts_f, ck["optimizers"]):
+            restore_optimizer_state(o, st)
+        # momentum buffers actually arrived (non-zero after 2 real steps)
+        n_nonzero = sum((v.abs().sum().item() > 0)
+                        for o in opts_f for v in o.state.values()
+                        if isinstance(v, dict)
+                        for v in [v for v in v.values()
+                                  if isinstance(v, torch.Tensor)])
+        check("restored momentum is non-empty", n_nonzero > 0, f"{n_nonzero}")
+
+        fresh.train()
+        _train_step(m, opts, ids)
+        _train_step(fresh, opts_f, ids)
+        names = [n for n in m.state_dict() if "freqs_cis" not in n]
+        d = max((m.state_dict()[n].float()
+                 - fresh.state_dict()[n].float()).abs().max().item() for n in names)
+        check("one more step matches after optimizer restore", d == 0.0,
+              f"max diff {d:.3e}")
+
+
 def main():
     torch.manual_seed(0)
     tests = [
@@ -275,6 +329,7 @@ def main():
         test_tied_embedding_survives_roundtrip,
         test_dspark_freeze_leaves_backbone_bit_identical,
         test_optimizer_state_roundtrip,
+        test_optimizer_state_survives_real_checkpoint,
     ]
     for t in tests:
         print(f"\n== {t.__name__} ==")

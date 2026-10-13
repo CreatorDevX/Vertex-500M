@@ -1,0 +1,66 @@
+# Example real run: single T4, fp16, FineWeb-Edu sample.
+# Edit paths/steps for your box, validate on a dev machine FIRST:
+#   python -m vertex500m.pipeline --config configs/t4-fp16.yaml --validate
+# then deploy the FILE (no terminal input is ever needed on the device):
+#   python -m vertex500m.pipeline --config configs/t4-fp16.yaml
+run_name: vertex-t4-base
+output_dir: runs
+
+data:
+  name: web
+  tokenizer: JamesQuartz/qt-VI.1.3-32k
+  val_fraction: 0.005
+  seed: 0
+  tokens_per_shard: 50000000
+  pack: docs                  # document-aware packing (needs the .idx.npy index)
+  download:
+    - path: HuggingFaceFW/fineweb-edu
+      split: train
+      text_field: text
+      limit_docs: 20000       # ~ a few hundred MB; raise for a real run
+  local: []                   # e.g. ["corpus/"]
+
+model:
+  hc_variant: mhc
+  tiny: false
+
+train:
+  amp: fp16                   # the only mode that makes sense on a T4 (sm_75)
+  device: auto
+  seed: 0
+  batch_size: 4
+  seq_len: 2048
+  loss_chunk: 1024
+  accum_steps: 32              # raise to trade step time for effective batch
+  grad_clip: 1.0
+  muon_lr: 0.02
+  adamw_lr: 0.00026
+  mtp_lr: 0.02
+  embed_lr: 0.02
+  weight_decay: 0.1
+  embed_optimizer: adamw
+  warmup: 1000
+  log_every: 20
+  save_every: 250
+  keep_last: 3
+  eval_every: 250
+  eval_batches: 8
+  stage_a_steps: 3000
+  stage_b_steps: 400
+
+eval:
+  batches: 16
+  seq_len: 2048
+  batch_size: 1
+  split: val
+  with_dspark: true
+
+tracking:
+  mode: online                # needs WANDB_API_KEY or `wandb login` before deploy;
+                              # use offline + `wandb sync` later if unsure
+  project: vertex500m
+  tags: [t4, fp16]
+
+pipeline:
+  run_tests: true             # full suites once, then recorded in state.json
+  offline: false

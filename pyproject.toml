@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vertex500m"
+version = "0.2.0"
+description = "Dense 503.8M reproduction of the DeepSeek-V4.1-Flash architecture, with an automated training pipeline"
+readme = "vertex500m/README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.4",
+    "numpy>=1.24",
+    "transformers>=4.40",
+    "datasets>=2.18",
+    "pyyaml>=6.0",
+    "wandb>=0.17",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+include = ["vertex500m*"]
+
+[tool.pytest.ini_options]
+testpaths = ["vertex500m"]
