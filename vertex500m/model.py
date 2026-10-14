@@ -207,6 +207,14 @@ class Transformer(torch.nn.Module):
     # ------------------------------------------------------------------ #
     # Decode-state snapshot / restore (speculative decoding only)
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _clone_fresh(fresh):
+        """Clone a `(tensor, first_group, n_groups)` publish tuple, or pass None through."""
+        if fresh is None:
+            return None
+        t, first, n = fresh
+        return (t.clone(), first, n)
+
     @torch.no_grad()
     def snapshot_decode_state(self, start_pos: int, width: int) -> dict:
         """Clone every buffer a `width`-wide forward at `start_pos` is about to write.
@@ -218,13 +226,29 @@ class Transformer(torch.nn.Module):
         just quietly attends to tokens that were never emitted, and the corruption
         compounds for the rest of the sequence.
 
-        Only tails are cloned: `compress_kv` and `index_k` are append-only in absolute
-        group index, so a forward at `start_pos` of width `width` can touch at most
-        `width // ratio + 1` groups at the end. Cloning the full `[B, max_len, hd]`
-        buffer every round would cost tens of MB per speculative step.
+        Only the groups a forward can touch are cloned: `compress_kv` and `index_k` are
+        append-only in ABSOLUTE group index, so a forward at `start_pos` of width
+        `width` writes groups `[start_pos // r, ceil((start_pos + width) / r))` and can
+        dirty at most that span plus the partial group feeding the PoolState. Cloning
+        the full `[B, max_len // r, hd]` buffer every round would cost tens of MB per
+        speculative step. The window MUST be anchored to `start_pos`, not to the end of
+        the buffer: decode typically runs far from `max_len`, so a buffer-end window
+        saves and restores groups the forward never wrote and silently leaves the real
+        ones corrupted.
+
+        `compress_fresh`/`index_fresh` are snapshotted too, even though they are
+        grad-carrying and must never be snapshotted during TRAINING. Decode runs under
+        `no_grad` (so there is no graph to sever) and these slots decide which branch
+        `_resolve_fresh` takes: `first == 0` reads the publish, otherwise the persistent
+        buffer. Leaving the verify's `(first=start_pos, ...)` in place after a rollback
+        silently flips the next forward to the buffer branch, which is NOT
+        value-equivalent -- a re-run would read different KV than the same tokens read on
+        an unrolled decode.
         """
         snap: dict = {"window": [], "pool": [], "tail": [],
-                      "shared": self.shared.snapshot_graph_free(), "engram": None}
+                      "shared": self.shared.snapshot_graph_free(), "engram": None,
+                      "fresh": (self._clone_fresh(self.shared.compress_fresh),
+                                self._clone_fresh(self.shared.index_fresh))}
         for layer in list(self.layers) + list(self.mtp):
             a = layer.attn
             if getattr(a, "window_kv", None) is not None:
@@ -237,8 +261,11 @@ class Transformer(torch.nn.Module):
                 buf = getattr(a, name, None)
                 if buf is None:
                     continue
-                lo = max(0, buf.size(1) - (width // r + 2))
-                snap["tail"].append((buf, lo, buf[:, lo:].clone()))
+                g0 = start_pos // r
+                g1 = -(-(start_pos + width) // r)
+                lo = max(0, g0 - 1)
+                hi = min(buf.size(1), g1 + 1)
+                snap["tail"].append((buf, lo, buf[:, lo:hi].clone()))
         if self.engram_hash is not None:
             # the id history is a plain [B, max_seq_len] store indexed by position
             c = self.engram_hash.cache
@@ -255,11 +282,12 @@ class Transformer(torch.nn.Module):
         for a, ps in snap["pool"]:
             a.pool_state.copy_from(ps)
         for buf, lo, tail in snap["tail"]:
-            buf[:, lo:].copy_(tail)
+            buf[:, lo:lo + tail.size(1)].copy_(tail)
         if snap["engram"] is not None:
             c, lo, seg = snap["engram"]
             c[:, lo:lo + seg.size(1)].copy_(seg)
         self.shared.restore_graph_free(snap["shared"])
+        self.shared.compress_fresh, self.shared.index_fresh = snap["fresh"]
 
     def reset_shared(self) -> None:
         """A no-op by design.

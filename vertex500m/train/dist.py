@@ -86,7 +86,11 @@ def wrap_ddp(model, dist_ctx: Dist, args):
     if not dist_ctx.enabled:
         return model
     import torch.nn as nn
-    device_ids = [dist_ctx.local_rank] if torch.cuda.is_available() else None
+    try:
+        dev = next(model.parameters()).device
+    except StopIteration:
+        dev = None
+    device_ids = [dev.index or 0] if dev is not None and dev.type == "cuda" else None
     return nn.parallel.DistributedDataParallel(
         model, device_ids=device_ids,
         # Stage B freezes the backbone, so every remaining trainable tensor is mtp.* and

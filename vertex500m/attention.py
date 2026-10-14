@@ -60,7 +60,10 @@ class SharedAttentionRuntime:
         dynamo/AOT cannot replay -- see `compressed_branch`). Rebinding discipline is
         the same as the buffers': producers publish before consumers read, rewrites are
         idempotent, so reverse-order checkpoint replay resolves correctly. Never
-        snapshot these (that would sever the graph, same as the buffers).
+        snapshot these during TRAINING (that would sever the graph, same as the
+        buffers); the speculative DECODE snapshot does clone them, because there the
+        values only choose which of two non-equivalent reads `_resolve_fresh` returns.
+        See `Transformer.snapshot_decode_state`.
 
     The per-producer buffers (`self.compress_kv`, `self.index_k`) are written
     idempotently -- same slice, same values -- so they need no value restoration, which
